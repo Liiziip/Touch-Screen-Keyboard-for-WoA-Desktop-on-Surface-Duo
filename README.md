@@ -1,4 +1,5 @@
 # Win10X-style Touch Keyboard
+## *If the original touch keyboard from win11/10 keeps popping up,then go to Settings > Time & language > Typing,change the option of "Show the touch keyboard" to "Never".
 
 A full-screen touch keyboard for **dual-screen Windows devices**, modeled after the
 Windows 10X keyboard. The primary target is a Surface Duo 1 running Windows on ARM
