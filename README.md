@@ -7,9 +7,6 @@ Windows 10X keyboard. The primary target is a Surface Duo 1 running Windows on A
 
 > Status: M1 prototype. Usable for everyday typing; APIs and interactions will change.
 
-![Dark theme](docs/preview-900x675.png)
-![Light theme](docs/preview-light-900x675.png)
-
 ## Why
 
 - The built-in Windows touch keyboard docks near the taskbar; it cannot be pinned to
