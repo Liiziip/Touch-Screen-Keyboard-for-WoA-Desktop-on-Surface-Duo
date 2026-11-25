@@ -1,4 +1,4 @@
-#pragma once
+﻿#pragma once
 #include <windows.h>
 #include <d2d1.h>
 #include <dwrite.h>
@@ -43,6 +43,7 @@ struct Renderer {
     IDWriteTextFormat* fMid = nullptr;
     IDWriteTextFormat* fMidL = nullptr;
     IDWriteTextFormat* fBig = nullptr;
+    IDWriteTextFormat* fIcon = nullptr;
 
     ID2D1SolidColorBrush* bKey = nullptr;
     ID2D1SolidColorBrush* bSpecial = nullptr;
@@ -59,7 +60,7 @@ struct Renderer {
 
     bool Init();
     bool EnsureTarget(HWND hwnd, int pxW, int pxH);
-    void SetSizes(float keyH);
+    void SetSizes(float keyH, float keyW);
     void SetTheme(bool dark);
     void SetAcrylic(bool on);
     void SetBackdrop(HBITMAP bmp, int w, int h);
@@ -69,7 +70,8 @@ struct Renderer {
               int ime, const std::wstring& target, const std::wstring& monitor,
               bool shiftOn, bool capsOn, bool ctrlOn, bool altOn, bool winOn, bool fnOn,
               const std::vector<MonButton>& mons, int curMon,
-              const std::vector<MonButton>& zoomBtns, HDC targetDC);
+              const std::vector<MonButton>& zoomBtns,
+              const std::vector<MonButton>& toolBtns, HDC targetDC);
 
 private:
     void BuildPalette();

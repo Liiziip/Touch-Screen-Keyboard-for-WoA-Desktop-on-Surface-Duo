@@ -4,6 +4,7 @@
 #include <objbase.h>
 #include <shellapi.h>
 #include <uiautomation.h>
+#include <dwmapi.h>
 #include <vector>
 #include <string>
 #include <algorithm>
@@ -19,17 +20,20 @@
 #pragma comment(lib, "oleaut32.lib")
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "uiautomationcore.lib")
+#pragma comment(lib, "dwmapi.lib")
 
-static const wchar_t* kClass = L"Win10XKeyboardM0";
+static const wchar_t* kClass = L"Win10XKeyboardM1";
 static const UINT TIMER_IME = 1;
 static const UINT TIMER_REPEAT = 2;
 static const UINT TIMER_AUTOCLOSE = 3;
 static const UINT TIMER_SELFTEST = 4;
 static const UINT TIMER_ALT = 5;
+static const UINT TIMER_LAYOUT = 6;
 
 static const UINT WM_TRAY = WM_APP + 10;
 static const UINT WM_SHOW_KEYBOARD = WM_APP + 11;
 static const UINT WM_TRAY_INIT = WM_APP + 12;
+static const UINT WM_RAISE_KEYBOARD = WM_APP + 13;
 
 struct MonInfo {
     RECT rc;
@@ -72,20 +76,28 @@ struct App {
     bool log = false;
     int  autocloseMs = 0;
     int  monitorIndex = 0;
+    int  screenMode = 0;      // 0 auto, 1 both panels (landscape), 2 left only, 3 right only
+    bool split = false;       // effective: landscape split layout active
+    int  viewMode = 0;        // 0 portrait, 1 split, 2 left half, 3 right half
+    int  splitLayer = 0;      // 0 = letters, 1 = numbers/symbols (split mode)
     RECT fullRect = { 0, 0, 0, 0 };
 
     std::vector<MonInfo> mons;
     std::vector<MonButton> monBtns;
     std::vector<MonButton> zoomBtns;
+    std::vector<MonButton> toolBtns;
+    ULONGLONG padLaunchTick = 0;
     float zoom = 1.0f;
     bool dark = true;
     int  themeOverride = -1;   // -1 = follow system, 0 = light, 1 = dark
 
     bool visible = true;
+    bool menuOpen = false;      // a popup menu is up; do not steal its z-order
+    bool modeMenuOpen = false;  // in-app mode menu (gear) is open
     bool quitting = false;
     bool software = false;      // --software: force the WARP/software D2D target
     bool autoShow = true;       // pop up when a text field gains focus (default on)
-    bool acrylic = true;        // blurred screenshot backdrop (--no-acrylic to disable)
+    bool acrylic = false;       // blurred screenshot backdrop; opt in with --acrylic
     HBITMAP bgBmp = nullptr;
     int bgW = 0, bgH = 0;
     bool bgDirty = false;
@@ -109,6 +121,55 @@ static void Log(const wchar_t* fmt, ...) {
     va_end(ap);
     fputws(L"\n", f);
     fclose(f);
+}
+
+// ---- persisted user preferences ----
+static bool LoadAcrylicPref() {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\DuoKeyboard", 0,
+                      KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) {
+        return false;
+    }
+    DWORD v = 0, cb = sizeof(v), type = 0;
+    LONG rc = RegQueryValueExW(k, L"Acrylic", nullptr, &type, (BYTE*)&v, &cb);
+    RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return false;
+    return v != 0;
+}
+
+static void SaveAcrylicPref(bool on) {
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\DuoKeyboard", 0, nullptr,
+                        0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD v = on ? 1 : 0;
+    RegSetValueExW(k, L"Acrylic", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(k);
+}
+
+static int LoadMonitorPref() {
+    HKEY k = nullptr;
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\DuoKeyboard", 0,
+                      KEY_QUERY_VALUE, &k) != ERROR_SUCCESS) {
+        return -1;
+    }
+    DWORD v = 0, cb = sizeof(v), type = 0;
+    LONG rc = RegQueryValueExW(k, L"Monitor", nullptr, &type, (BYTE*)&v, &cb);
+    RegCloseKey(k);
+    if (rc != ERROR_SUCCESS || type != REG_DWORD) return -1;
+    return (int)v;
+}
+
+static void SaveMonitorPref(int idx) {
+    HKEY k = nullptr;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\DuoKeyboard", 0, nullptr,
+                        0, KEY_SET_VALUE, nullptr, &k, nullptr) != ERROR_SUCCESS) {
+        return;
+    }
+    DWORD v = (DWORD)idx;
+    RegSetValueExW(k, L"Monitor", 0, REG_DWORD, (const BYTE*)&v, sizeof(v));
+    RegCloseKey(k);
 }
 
 static bool IsDarkTheme() {
@@ -156,41 +217,70 @@ static std::vector<MonInfo> EnumMons() {
 }
 
 static void BuildMonButtons(App* a) {
+    // Display / zoom live in the settings menu; Touchpad stays in the status
+    // row, right aligned.
     a->monBtns.clear();
+    a->zoomBtns.clear();
+    a->toolBtns.clear();
+    if (a->viewMode != 0) return;
+
     float y = a->L.gridY - 66.0f;
     if (y < 96.0f) y = 96.0f;
-    const float w = 150.0f, h = 44.0f, gap = 8.0f;
-    float x = 78.0f;
-    for (size_t i = 0; i < a->mons.size(); ++i) {
-        MonButton b;
-        b.x = x;
-        b.y = y;
-        b.w = w;
-        b.h = h;
-        wchar_t buf[64];
-        swprintf_s(buf, L"Display %d%s", (int)i + 1,
-                   a->mons[i].primary ? L" \u00B7Main" : L"");
-        b.label = buf;
-        a->monBtns.push_back(b);
-        x += w + gap;
+    MonButton b;
+    b.w = 150.0f;
+    b.h = 44.0f;
+    b.x = a->L.designW - 16.0f - b.w;
+    b.y = y;
+    b.label = L"Touchpad";
+    a->toolBtns.push_back(b);
+}
+
+// The shell's virtual touchpad is a UWP window: a frame hosting a core window.
+static BOOL CALLBACK FindPadProc(HWND h, LPARAM lp) {
+    wchar_t cls[64] = {};
+    GetClassNameW(h, cls, 64);
+    wchar_t title[256] = {};
+    GetWindowTextW(h, title, 256);
+
+    if (wcsstr(title, L"Touchpad")) {
+        HWND core = FindWindowExW(h, nullptr, L"Windows.UI.Core.CoreWindow", nullptr);
+        *(HWND*)lp = core ? core : h;
+        return FALSE;
     }
+    if (lstrcmpW(cls, L"ApplicationFrameWindow") == 0) {
+        HWND child = nullptr;
+        while ((child = FindWindowExW(h, child, L"Windows.UI.Core.CoreWindow", nullptr)) != nullptr) {
+            wchar_t ct[256] = {};
+            GetWindowTextW(child, ct, 256);
+            if (wcsstr(ct, L"Shell Experience Host") || wcsstr(ct, L"Touchpad")) {
+                *(HWND*)lp = child;
+                return FALSE;
+            }
+        }
+    }
+    return TRUE;
+}
 
-    // Zoom controls sit right after the monitor group.
-    a->zoomBtns.clear();
-    float zx = x + 16.0f;
-    wchar_t pct[16];
-    swprintf_s(pct, L"%d%%", (int)(a->zoom * 100.0f + 0.5f));
+static HWND FindVirtualTouchpadChild() {
+    HWND found = nullptr;
+    EnumWindows(FindPadProc, (LPARAM)&found);
+    return found;
+}
 
-    MonButton minus;
-    minus.x = zx; minus.y = y; minus.w = 40.0f; minus.h = h; minus.label = L"-";
-    MonButton label;
-    label.x = zx + 46.0f; label.y = y; label.w = 64.0f; label.h = h; label.label = pct;
-    MonButton plus;
-    plus.x = zx + 116.0f; plus.y = y; plus.w = 40.0f; plus.h = h; plus.label = L"+";
+static void ToggleVirtualTouchpad(App* a) {
+    HWND pad = FindVirtualTouchpadChild();
+    if (pad) {
+        PostMessageW(pad, WM_CLOSE, 0, 0);
+        if (a->log) Log(L"virtual touchpad: close");
+        return;
+    }
+    if (GetTickCount64() - a->padLaunchTick < 1200) return;   // debounce
+    a->padLaunchTick = GetTickCount64();
 
-    a->zoomBtns.push_back(minus);
-    a->zoomBtns.push_back(label);
-    a->zoomBtns.push_back(plus);
+    HINSTANCE r = ShellExecuteW(a->hwnd, L"open", L"ms-virtualtouchpad:",
+                                nullptr, nullptr, SW_SHOWNORMAL);
+    if (a->log) Log(L"virtual touchpad: launch ret=%p", (void*)r);
+    (void)r;
 }
 
 static void Relayout(App* a) {
@@ -199,8 +289,33 @@ static void Relayout(App* a) {
     a->widthDip = (float)(rc.right - rc.left) / a->scale;
     a->heightDip = (float)(rc.bottom - rc.top) / a->scale;
     if (a->widthDip < 100.0f || a->heightDip < 100.0f) return;
-    a->L = BuildLayout(a->widthDip, a->heightDip, a->zoom);
-    a->R.SetSizes(a->L.keyH);
+    switch (a->viewMode) {
+    case 1:
+        a->L = BuildSplitLayout(a->widthDip, a->heightDip, a->zoom, a->splitLayer != 0);
+        break;
+    case 2:
+    case 3:
+        a->L = BuildPanelLayout(a->widthDip, a->heightDip, a->zoom, a->splitLayer != 0);
+        break;
+    default:
+        a->L = BuildLayout(a->widthDip, a->heightDip, a->zoom);
+        break;
+    }
+    a->L.showModeMenu = a->modeMenuOpen;
+    a->L.acrylicOn = a->acrylic;
+    a->L.menuSel = (a->screenMode == 0) ? (a->viewMode == 1 ? 1 : 0) : a->screenMode;
+    if (a->L.menuPortrait) {
+        int n = (int)a->mons.size();
+        if (n > 4) n = 4;
+        a->L.dispCount = n;
+        for (int i = 0; i < n; ++i) {
+            wchar_t buf[64];
+            swprintf_s(buf, L"Display %d", i + 1);
+            a->L.dispLabel[i] = buf;
+        }
+        a->L.dispSel = a->monitorIndex;
+    }
+    a->R.SetSizes(a->L.keyH, a->L.keyW);
     BuildMonButtons(a);
     if (a->log) {
         Log(L"Relayout client=%ldx%ld scale=%.3f dip=%.1fx%.1f key=%.1fx%.1f gridY=%.1f gridH=%.1f",
@@ -257,15 +372,99 @@ static void BoxBlurBitmap(HBITMAP bmp, int w, int h, int radius) {
     ReleaseDC(nullptr, dc);
 }
 
+// Two panels side by side share the same top edge.
+static bool MonitorsSideBySide(const std::vector<MonInfo>& mons) {
+    if (mons.size() < 2) return false;
+    return mons[0].rc.top == mons[1].rc.top && mons[0].rc.left != mons[1].rc.left;
+}
+
+// Posture is decided by the panel resolution:
+//   1800x1350 (wider than tall) -> book/portrait, keyboard on the lower panel
+//   1350x1800 (taller than wide) -> flat landscape, keyboard spans both panels
+static bool IsLandscapePosture(const std::vector<MonInfo>& mons, int* outW, int* outH) {
+    if (outW) *outW = 0;
+    if (outH) *outH = 0;
+    if (mons.empty()) return false;
+    const int w = mons[0].rc.right - mons[0].rc.left;
+    const int h = mons[0].rc.bottom - mons[0].rc.top;
+    if (outW) *outW = w;
+    if (outH) *outH = h;
+
+    bool wide = false;
+    if (w == 1800 && h == 1350) wide = false;      // 1800x1350 -> single screen
+    else if (w == 1350 && h == 1800) wide = true;  // 1350x1800 -> span both
+    else wide = (w < h);
+    if (wide && !MonitorsSideBySide(mons)) wide = false;
+    return wide;
+}
+
+// Window rectangle + view mode for the current posture.
+//   1 = split (both panels), 2 = left half, 3 = right half, 0 = portrait panel.
+static RECT ComputeWindowRect(App* a, int* viewOut) {
+    RECT r = { 0, 0, 0, 0 };
+    if (viewOut) *viewOut = 0;
+    std::vector<MonInfo> mons = EnumMons();
+    if (mons.empty()) return r;
+
+    int pw = 0, ph = 0;
+    bool landscape = IsLandscapePosture(mons, &pw, &ph);
+    int mode = a->screenMode;
+    if (mode == 0) mode = landscape ? 1 : 0;
+    if (a->log) Log(L"posture: %dx%d -> %s (mode=%d)", pw, ph,
+                    landscape ? L"landscape/split" : L"portrait/single", mode);
+
+    if (mode == 1 && landscape) {
+        RECT u;
+        u.left = (std::min)(mons[0].rc.left, mons[1].rc.left);
+        u.top = (std::min)(mons[0].rc.top, mons[1].rc.top);
+        u.right = (std::max)(mons[0].rc.right, mons[1].rc.right);
+        u.bottom = (std::max)(mons[0].rc.bottom, mons[1].rc.bottom);
+        int h = u.bottom - u.top;
+        // Keyboard strip: 45% of the panel height, so the keys stay compact.
+        int kh = (int)((long long)h * 450 / 1000);
+        u.top = u.bottom - kh;
+        r = u;
+        if (viewOut) *viewOut = 1;
+        return r;
+    }
+
+    if (mode == 2) {                 // keyboard strip on the left panel
+        r = mons[0].rc;
+        int h = r.bottom - r.top;
+        r.top = r.bottom - (int)((long long)h * 450 / 1000);
+        if (viewOut) *viewOut = 2;
+        return r;
+    }
+    if (mode == 3) {                 // keyboard strip on the right panel
+        r = mons[mons.size() - 1].rc;
+        int h = r.bottom - r.top;
+        r.top = r.bottom - (int)((long long)h * 450 / 1000);
+        if (viewOut) *viewOut = 3;
+        return r;
+    }
+
+    // Portrait: keyboard on the lower panel.
+    int idx = (int)mons.size() - 1;
+    if (a->monitorIndex >= 0 && a->monitorIndex < (int)mons.size())
+        idx = a->monitorIndex;
+    r = mons[idx].rc;
+    return r;
+}
+
 // Simulated acrylic: grab what is on the target screen before the keyboard is
 // shown, blur it, and use it as a static backdrop.
 static void CaptureBackdrop(App* a) {
     if (!a->acrylic) return;
     RECT r = { 0, 0, 0, 0 };
-    if (a->monitorIndex >= 0 && a->monitorIndex < (int)a->mons.size())
-        r = a->mons[a->monitorIndex].rc;
-    else if (a->hwnd)
-        GetWindowRect(a->hwnd, &r);
+    int view = 0;
+    if (a->preview) {
+        if (a->hwnd) GetWindowRect(a->hwnd, &r);
+    } else {
+        r = ComputeWindowRect(a, &view);
+    }
+    if (r.right <= r.left || r.bottom <= r.top) {
+        if (a->hwnd) GetWindowRect(a->hwnd, &r);
+    }
     int w = r.right - r.left;
     int h = r.bottom - r.top;
     if (w <= 0 || h <= 0) return;
@@ -275,17 +474,43 @@ static void CaptureBackdrop(App* a) {
     HDC full = CreateCompatibleDC(screen);
     HBITMAP fullBmp = CreateCompatibleBitmap(screen, w, h);
     HGDIOBJ oldFull = SelectObject(full, fullBmp);
-    BitBlt(full, 0, 0, w, h, screen, r.left, r.top, SRCCOPY);
-
     int sw = w / 10, sh = h / 10;
     if (sw < 16) sw = 16;
     if (sh < 16) sh = 16;
     HDC blurDC = CreateCompatibleDC(screen);
     HBITMAP smallBmp = CreateCompatibleBitmap(screen, sw, sh);
     HGDIOBJ oldSmall = SelectObject(blurDC, smallBmp);
-    SetStretchBltMode(blurDC, HALFTONE);
-    SetBrushOrgEx(blurDC, 0, 0, nullptr);
-    StretchBlt(blurDC, 0, 0, sw, sh, full, 0, 0, w, h, SRCCOPY);
+
+    // Rotation can leave a white transition frame on screen for a moment; if
+    // the shot looks blank, wait and grab it again.
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        BitBlt(full, 0, 0, w, h, screen, r.left, r.top, SRCCOPY);
+        SetStretchBltMode(blurDC, HALFTONE);
+        SetBrushOrgEx(blurDC, 0, 0, nullptr);
+        StretchBlt(blurDC, 0, 0, sw, sh, full, 0, 0, w, h, SRCCOPY);
+
+        BITMAPINFO bi;
+        ZeroMemory(&bi, sizeof(bi));
+        bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+        bi.bmiHeader.biWidth = sw;
+        bi.bmiHeader.biHeight = -sh;
+        bi.bmiHeader.biPlanes = 1;
+        bi.bmiHeader.biBitCount = 32;
+        bi.bmiHeader.biCompression = BI_RGB;
+        std::vector<DWORD> thumb((size_t)sw * (size_t)sh);
+        if (GetDIBits(blurDC, smallBmp, 0, sh, thumb.data(), &bi, DIB_RGB_COLORS)) {
+            long long sum = 0;
+            for (size_t i = 0; i < thumb.size(); ++i) {
+                DWORD c = thumb[i];
+                sum += (long long)((c & 0xFF) + ((c >> 8) & 0xFF) + ((c >> 16) & 0xFF));
+            }
+            int avg = (int)(sum / (3 * (long long)thumb.size()));
+            if (a->log) Log(L"backdrop: rect=(%ld,%ld)-(%ld,%ld) try=%d avg=%d",
+                            r.left, r.top, r.right, r.bottom, attempt, avg);
+            if (avg < 235 || attempt == 7) break;
+        }
+        Sleep(220);
+    }
     BoxBlurBitmap(smallBmp, sw, sh, 2);
     SetStretchBltMode(full, HALFTONE);
     SetBrushOrgEx(full, 0, 0, nullptr);
@@ -306,19 +531,57 @@ static void CaptureBackdrop(App* a) {
     if (a->log) Log(L"backdrop captured %dx%d", w, h);
 }
 
-static void ApplyFullscreen(App* a) {
-    if (a->preview) return;
+// Hiding and capturing in the same frame can still pick up the composed image
+// that contains the keyboard, so let the compositor settle before grabbing.
+static void HideAndCaptureBackdrop(App* a) {
+    if (!a->acrylic || !a->hwnd) return;
+    ShowWindow(a->hwnd, SW_HIDE);
+
+    // The compositor needs a moment before the desktop behind us is back in
+    // the frame; repaint the desktop and give it a longer beat.
+    RedrawWindow(GetDesktopWindow(), nullptr, nullptr,
+                 RDW_INVALIDATE | RDW_ALLCHILDREN | RDW_UPDATENOW | RDW_ERASE);
+    DwmFlush();
+    Sleep(320);
+    DwmFlush();
+
+    CaptureBackdrop(a);
+}
+static void ApplyWindowLayout(App* a) {
+    if (a->preview || !a->hwnd) return;
     auto mons = EnumMons();
     if (mons.empty()) return;
-    int idx = a->monitorIndex;
-    if (idx < 0 || idx >= (int)mons.size()) idx = 0;
-    RECT r = mons[idx].rc;
+    a->mons = mons;
+    if (a->monitorIndex < 0 || a->monitorIndex >= (int)a->mons.size())
+        a->monitorIndex = (int)a->mons.size() - 1;
+
+    // The new layout covers a different screen area: re-capture the backdrop
+    // while the window is hidden, otherwise the old blur stays on screen.
+    if (a->acrylic && IsWindowVisible(a->hwnd)) HideAndCaptureBackdrop(a);
+
+    int view = 0;
+    RECT r = ComputeWindowRect(a, &view);
+    if (r.right <= r.left || r.bottom <= r.top) return;
+
+    a->viewMode = view;
+    a->split = (view == 1);
+    if (view == 0) a->splitLayer = 0;
     a->fullRect = r;
-    a->monitor = mons[idx].dev;
+    a->monitor = a->mons[a->monitorIndex].dev;
     SetWindowPos(a->hwnd, a->topmost ? HWND_TOPMOST : HWND_NOTOPMOST,
                  r.left, r.top, r.right - r.left, r.bottom - r.top,
                  SWP_NOACTIVATE | SWP_SHOWWINDOW);
     ForceTopmost(a);
+    Relayout(a);
+}
+
+static void ShowModeMenu(App* a) {
+    // In-app menu: span / left / right, drawn by the renderer.
+    a->modeMenuOpen = !a->modeMenuOpen;
+    a->L.showModeMenu = a->modeMenuOpen;
+    a->L.acrylicOn = a->acrylic;
+    a->L.menuSel = a->screenMode;
+    InvalidateRect(a->hwnd, nullptr, FALSE);
 }
 
 static float PreviewScale() {
@@ -347,6 +610,7 @@ static void RefreshMonitors(App* a) {
 static void SelectMonitor(App* a, int idx) {
     if (idx < 0 || idx >= (int)a->mons.size()) return;
     a->monitorIndex = idx;
+    SaveMonitorPref(idx);
     if (a->log) Log(L"SelectMonitor idx=%d", idx);
     if (a->preview) {
         RECT r = a->mons[idx].rc;
@@ -356,8 +620,7 @@ static void SelectMonitor(App* a, int idx) {
                      r.left + 40, r.top + 40, w, h, SWP_NOACTIVATE);
     } else {
         CaptureBackdrop(a);   // the new screen is still uncovered
-        ApplyFullscreen(a);
-        Relayout(a);
+        ApplyWindowLayout(a);
     }
     InvalidateRect(a->hwnd, nullptr, FALSE);
 }
@@ -365,8 +628,8 @@ static void SelectMonitor(App* a, int idx) {
 static void ResizePreview(App* a) {
     RECT wr;
     GetWindowRect(a->hwnd, &wr);
-    int w = (int)(900.0f * a->scale);
-    int h = (int)(675.0f * a->scale);
+    int w = a->viewMode == 1 ? 1350 : (a->viewMode == 2 || a->viewMode == 3) ? 675 : (int)(900.0f * a->scale);
+    int h = a->viewMode == 1 ? 405 : (a->viewMode == 2 || a->viewMode == 3) ? 405 : (int)(675.0f * a->scale);
     SetWindowPos(a->hwnd, nullptr, wr.left, wr.top, w, h, SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
@@ -374,16 +637,6 @@ static void ForceTopmost(App* a) {
     if (!a->topmost) return;
     SetWindowPos(a->hwnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-}
-
-static bool IsTaskbarForeground() {
-    HWND fg = GetForegroundWindow();
-    if (!fg) return false;
-    wchar_t cls[64];
-    ZeroMemory(cls, sizeof(cls));
-    if (!GetClassNameW(fg, cls, 63)) return false;
-    return lstrcmpW(cls, L"Shell_TrayWnd") == 0 ||
-           lstrcmpW(cls, L"Shell_SecondaryTrayWnd") == 0;
 }
 
 static void PollTarget(App* a) {
@@ -397,9 +650,10 @@ static void PollTarget(App* a) {
     int ime = ReadImeState(fg);
     if (ime != a->ime) { a->ime = ime; changed = true; }
 
-    // The taskbar is topmost and, once focused, the shell keeps it above us.
-    // Re-assert our z-order while it owns the foreground so we still cover it.
-    if (a->visible && IsTaskbarForeground()) ForceTopmost(a);
+    // The taskbar/Start menu are topmost and win the z-order as soon as they
+    // are touched; keep re-asserting so the keyboard stays on top after a
+    // layout switch too.
+    if (a->visible && !a->menuOpen) ForceTopmost(a);
 
     if (changed) InvalidateRect(a->hwnd, nullptr, FALSE);
 }
@@ -416,6 +670,67 @@ static bool CanRepeat(KeyAct act) {
 }
 
 static void PressDown(App* a, float x, float y) {
+    if (a->modeMenuOpen) {
+        if (a->L.acrylicBtn.Contains(x, y)) {
+            a->acrylic = !a->acrylic;
+            SaveAcrylicPref(a->acrylic);      // remember the choice across runs
+            a->R.SetAcrylic(a->acrylic);
+            a->L.acrylicOn = a->acrylic;
+            if (a->acrylic) {
+                HideAndCaptureBackdrop(a);
+                ShowWindow(a->hwnd, SW_SHOWNOACTIVATE);
+                ForceTopmost(a);
+            }
+            InvalidateRect(a->hwnd, nullptr, FALSE);
+            return;
+        }
+        if (a->L.menuPortrait) {
+            for (int i = 0; i < a->L.dispCount; ++i) {
+                if (a->L.dispBtn[i].Contains(x, y)) {
+                    a->modeMenuOpen = false;
+                    a->L.showModeMenu = false;
+                    SelectMonitor(a, i);
+                    return;
+                }
+            }
+            if (a->L.zoomBtn[0].Contains(x, y) || a->L.zoomBtn[2].Contains(x, y)) {
+                if (a->L.zoomBtn[2].Contains(x, y))
+                    a->zoom = (std::min)(1.0f, a->zoom + 0.1f);
+                else
+                    a->zoom = (std::max)(0.6f, a->zoom - 0.1f);
+                Relayout(a);
+                InvalidateRect(a->hwnd, nullptr, FALSE);
+                return;
+            }
+            a->modeMenuOpen = false;
+            a->L.showModeMenu = false;
+            InvalidateRect(a->hwnd, nullptr, FALSE);
+            return;
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (a->L.modeBtn[i].Contains(x, y)) {
+                a->screenMode = i + 1;      // 1 span, 2 left, 3 right
+                a->modeMenuOpen = false;
+                ApplyWindowLayout(a);
+                InvalidateRect(a->hwnd, nullptr, FALSE);
+                return;
+            }
+        }
+        a->modeMenuOpen = false;
+        a->L.showModeMenu = false;
+        InvalidateRect(a->hwnd, nullptr, FALSE);
+        return;
+    }
+    if (a->L.gearBtn.Contains(x, y)) {
+        if (a->log) Log(L"chrome: gear");
+        ShowModeMenu(a);
+        return;
+    }
+    if ((a->L.split || a->L.half) && a->L.closeBtn2.Contains(x, y)) {
+        if (a->log) Log(L"chrome: close");
+        PostMessageW(a->hwnd, WM_CLOSE, 0, 0);
+        return;
+    }
     for (size_t i = 0; i < a->zoomBtns.size(); ++i) {
         const MonButton& b = a->zoomBtns[i];
         if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
@@ -429,6 +744,13 @@ static void PressDown(App* a, float x, float y) {
             if (a->log) Log(L"Zoom -> %.0f%%", a->zoom * 100.0f);
             Relayout(a);
             InvalidateRect(a->hwnd, nullptr, FALSE);
+            return;
+        }
+    }
+    for (size_t i = 0; i < a->toolBtns.size(); ++i) {
+        const MonButton& b = a->toolBtns[i];
+        if (x >= b.x && x <= b.x + b.w && y >= b.y && y <= b.y + b.h) {
+            ToggleVirtualTouchpad(a);
             return;
         }
     }
@@ -480,6 +802,12 @@ static void PressDown(App* a, float x, float y) {
         }
         return;
     case KA_Fn:    a->fnOn = !a->fnOn;       return;
+    case KA_Ime:   return;                   // placeholder, no action yet
+    case KA_Layer:
+        a->splitLayer ^= 1;
+        Relayout(a);
+        InvalidateRect(a->hwnd, nullptr, FALSE);
+        return;
     case KA_Close: PostMessageW(a->hwnd, WM_CLOSE, 0, 0); return;
     default: break;
     }
@@ -589,7 +917,7 @@ static void ShowKeyboard(App* a) {
     }
     CaptureBackdrop(a);          // still hidden, so the screen is clean
     a->visible = true;
-    ApplyFullscreen(a);
+    ApplyWindowLayout(a);
     ShowWindow(a->hwnd, SW_SHOWNOACTIVATE);
     ForceTopmost(a);
     InvalidateRect(a->hwnd, nullptr, TRUE);
@@ -637,8 +965,10 @@ static void ShowTrayMenu(App* a) {
 
     HWND prev = GetForegroundWindow();
     SetForegroundWindow(a->hwnd);
+    a->menuOpen = true;
     int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON,
                              pt.x, pt.y, 0, a->hwnd, nullptr);
+    a->menuOpen = false;
     DestroyMenu(menu);
     if (prev && prev != a->hwnd && IsWindow(prev)) SetForegroundWindow(prev);
 
@@ -772,10 +1102,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
     }
 
     case WM_DISPLAYCHANGE:
+        a->screenMode = 0;      // re-detect the posture from the panel resolution
+        a->splitLayer = 0;
         RefreshMonitors(a);
-        ApplyFullscreen(a);
-        Relayout(a);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        // Rotation shows a white transition frame for a moment; wait it out
+        // before re-laying out (and re-capturing the backdrop).
+        SetTimer(hwnd, TIMER_LAYOUT, 650, nullptr);
         return 0;
 
     case WM_SETTINGCHANGE:
@@ -806,7 +1138,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             }
             a->R.Draw(a->L, a->scale, a->widthDip, a->pressed, a->ime, a->target,
                       a->monitor, a->shiftOn, a->capsOn, a->ctrlOn, a->altOn, a->winOn, a->fnOn,
-                      a->monBtns, a->monitorIndex, a->zoomBtns, ps.hdc);
+                      a->monBtns, a->monitorIndex, a->zoomBtns, a->toolBtns, ps.hdc);
             if (a->log) Log(L"paint: drawn");
         }
         EndPaint(hwnd, &ps);
@@ -862,6 +1194,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         return 0;
 
     case WM_TIMER:
+        if (wParam == TIMER_LAYOUT) {
+            KillTimer(hwnd, TIMER_LAYOUT);
+            ApplyWindowLayout(a);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
         if (wParam == TIMER_IME) {
             PollTarget(a);
         } else if (wParam == TIMER_REPEAT) {
@@ -913,6 +1251,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         if (!a->visible) ShowKeyboard(a);
         return 0;
 
+    case WM_RAISE_KEYBOARD:
+        ForceTopmost(a);
+        return 0;
+
     case WM_CLOSE:
         if (a->quitting || !a->trayAdded) DestroyWindow(hwnd);
         else HideKeyboard(a);
@@ -938,21 +1280,47 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
 int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+    // One instance per session: a second launch just brings the keyboard back.
+    HANDLE instanceMutex = CreateMutexW(nullptr, FALSE, L"Local\\DuoKeyboard_SingleInstance");
+    if (instanceMutex && GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND prev = FindWindowW(kClass, nullptr);
+        if (prev) {
+            PostMessageW(prev, WM_SHOW_KEYBOARD, 0, 0);
+            PostMessageW(prev, WM_APP + 13, 0, 0);   // raise z-order
+        }
+        CloseHandle(instanceMutex);
+        return 0;
+    }
+
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
 
     App app;
     g = &app;
 
     int argc = 0;
+    bool acrylicExplicit = false;
+    bool monitorExplicit = false;
     LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
     for (int i = 1; i < argc; ++i) {
         std::wstring s = argv[i];
         if (s == L"--preview") {
             app.preview = true;
+        } else if (s == L"--split") {
+            app.screenMode = 1;
+        } else if (s == L"--menu") {
+            app.modeMenuOpen = true;   // show the mode menu at startup (preview aid)
+        } else if (s == L"--mode" && i + 1 < argc) {
+            std::wstring m = argv[++i];
+            if (m == L"both") app.screenMode = 1;
+            else if (m == L"left") app.screenMode = 2;
+            else if (m == L"right") app.screenMode = 3;
+            else app.screenMode = 0;
         } else if (s == L"--no-topmost") {
             app.topmost = false;
         } else if (s == L"--monitor" && i + 1 < argc) {
             app.monitorIndex = _wtoi(argv[++i]);
+            monitorExplicit = true;
         } else if (s == L"--autoclose" && i + 1 < argc) {
             app.autocloseMs = _wtoi(argv[++i]);
         } else if (s == L"--selftest") {
@@ -965,8 +1333,12 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
             app.log = true;
         } else if (s == L"--software") {
             app.software = true;
+        } else if (s == L"--acrylic") {
+            app.acrylic = true;
+            acrylicExplicit = true;
         } else if (s == L"--no-acrylic") {
             app.acrylic = false;
+            acrylicExplicit = true;
         } else if (s == L"--auto-show") {
             app.autoShow = true;
         } else if (s == L"--no-auto-show") {
@@ -994,6 +1366,11 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
     }
     if (argv) LocalFree(argv);
 
+    if (!acrylicExplicit) app.acrylic = LoadAcrylicPref();
+    if (!monitorExplicit) {
+        int m = LoadMonitorPref();
+        if (m >= 0) app.monitorIndex = m;
+    }
     app.R.software = app.software;
     app.R.acrylic = app.acrylic;
     if (!app.R.Init()) {
@@ -1018,8 +1395,22 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         UINT dpi = GetDpiForSystem();
         wr.left = 0;
         wr.top = 0;
-        wr.right = wr.left + MulDiv(900, (int)dpi, 96);
-        wr.bottom = wr.top + MulDiv(675, (int)dpi, 96);
+        if (app.screenMode == 1) {
+            // Split layout preview: 1350x405 DIP at 1:1 pixels (45% strip).
+            wr.right = 1350;
+            wr.bottom = 405;
+            app.split = true;
+            app.viewMode = 1;
+        } else if (app.screenMode == 2 || app.screenMode == 3) {
+            // Half layout preview: 675x405 DIP (one panel's keyboard strip).
+            wr.right = 675;
+            wr.bottom = 405;
+            app.viewMode = app.screenMode;
+        } else {
+            wr.right = wr.left + MulDiv(900, (int)dpi, 96);
+            wr.bottom = wr.top + MulDiv(675, (int)dpi, 96);
+            app.viewMode = 0;
+        }
         app.monitor = L"preview";
     } else {
         auto mons = EnumMons();
@@ -1027,7 +1418,10 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         int idx = app.monitorIndex;
         if (idx < 0 || idx >= (int)mons.size()) idx = (mons.size() > 1) ? 1 : 0;
         app.monitorIndex = idx;
-        wr = mons[idx].rc;
+        int view = 0;
+        wr = ComputeWindowRect(&app, &view);
+        app.viewMode = view;
+        app.split = (view == 1);
         app.monitor = mons[idx].dev;
     }
 
@@ -1051,7 +1445,7 @@ int APIENTRY wWinMain(HINSTANCE hInst, HINSTANCE, LPWSTR, int) {
         SetWindowPos(hwnd, app.topmost ? HWND_TOPMOST : HWND_NOTOPMOST, 0, 0, 0, 0,
                      SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
     } else {
-        ApplyFullscreen(&app);
+        ApplyWindowLayout(&app);
     }
     UpdateWindow(hwnd);
 

@@ -1,4 +1,4 @@
-#include "render.h"
+﻿#include "render.h"
 #include <cstdio>
 #include <vector>
 
@@ -57,6 +57,7 @@ void Renderer::SetTheme(bool dark) {
 
 void Renderer::SetAcrylic(bool on) {
     acrylic = on;
+    if (!on && bgBmp) { bgBmp->Release(); bgBmp = nullptr; }
     BuildPalette();
     if (rt) {
         ReleaseBrushes();
@@ -157,12 +158,15 @@ bool Renderer::EnsureTarget(HWND hwnd, int pxW, int pxH) {
     return true;
 }
 
-void Renderer::SetSizes(float keyH) {
+void Renderer::SetSizes(float keyH, float keyW) {
     if (!dw) return;
+    // Never let a label outgrow a narrow key.
+    float base = (std::min)(keyH * 0.30f, keyW * 0.42f);
+    if (base < 10.0f) base = 10.0f;
     struct Slot { IDWriteTextFormat** p; float size; bool left; };
     Slot slots[] = {
-        { &fKey,    keyH * 0.30f, false },
-        { &fKey2,   keyH * 0.20f, false },
+        { &fKey,    base, false },
+        { &fKey2,   base * 0.66f, false },
         { &fSmall,  14.0f, false },
         { &fSmallL, 14.0f, true  },
         { &fMid,    18.0f, false },
@@ -179,6 +183,15 @@ void Renderer::SetSizes(float keyH) {
             (*s.p)->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
             (*s.p)->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
         }
+    }
+
+    if (fIcon) { fIcon->Release(); fIcon = nullptr; }
+    if (SUCCEEDED(dw->CreateTextFormat(L"Segoe MDL2 Assets", nullptr,
+            DWRITE_FONT_WEIGHT_NORMAL, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 15.0f, L"zh-CN", &fIcon))) {
+        fIcon->SetTextAlignment(DWRITE_TEXT_ALIGNMENT_CENTER);
+        fIcon->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        fIcon->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
     }
 }
 
@@ -201,6 +214,7 @@ void Renderer::Shutdown() {
     if (fMid)  { fMid->Release();  fMid = nullptr; }
     if (fMidL) { fMidL->Release(); fMidL = nullptr; }
     if (fBig)  { fBig->Release();  fBig = nullptr; }
+    if (fIcon) { fIcon->Release(); fIcon = nullptr; }
     if (dw) { dw->Release(); dw = nullptr; }
     if (d2d){ d2d->Release(); d2d = nullptr; }
 }
@@ -209,7 +223,8 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
                     int ime, const std::wstring& target, const std::wstring& monitor,
                     bool shiftOn, bool capsOn, bool ctrlOn, bool altOn, bool winOn, bool fnOn,
                     const std::vector<MonButton>& mons, int curMon,
-                    const std::vector<MonButton>& zoomBtns, HDC targetDC) {
+                    const std::vector<MonButton>& zoomBtns,
+                    const std::vector<MonButton>& toolBtns, HDC targetDC) {
     if (!rt) return;
 
     RECT bindRect = { 0, 0, memW, memH };
@@ -220,7 +235,7 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
                          D2D1::Matrix3x2F::Scale(scale, scale);
     rt->SetTransform(xf);
     rt->Clear(pal.bg);
-    if (bgBmp) {
+    if (acrylic && bgBmp) {
         // Cover the whole window, not just the 900x675 canvas, so the blurred
         // backdrop reaches the letterboxed edges too.
         float winW = (scale > 0.0f) ? (float)memW / scale : L.designW;
@@ -237,19 +252,37 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
                                            D2D1_DRAW_TEXT_OPTIONS_CLIP);
     };
 
-    // ---- floating close button ----
-    D2D1_RECT_F closeR = Rect(L.designW - 44, 8, L.designW - 12, 40);
-    rt->FillRoundedRectangle(D2D1::RoundedRect(closeR, 6, 6), bSpecial);
-    text(L"\x00D7", fMid, closeR, bText);
+    // ---- floating close button (single-screen layout) ----
+    if (!L.split && !L.half) {
+        D2D1_RECT_F closeR = Rect(L.designW - 44, 8, L.designW - 12, 40);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(closeR, 6, 6), bSpecial);
+        text(L"\x00D7", fMid, closeR, bText);
+
+        if (L.menuPortrait) {
+            D2D1_RECT_F gr = Rect(L.gearBtn.l, L.gearBtn.t, L.gearBtn.r, L.gearBtn.b);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(gr, 5, 5), bSpecial);
+            text(L"\xE713", fIcon, gr, bText);
+        }
+    } else {
+        // Landscape split: gear at the top-left of the left half, close at the
+        // top-left of the right half.
+        auto iconBtn = [&](const RectF& r, const wchar_t* glyph) {
+            D2D1_RECT_F rr = Rect(r.l, r.t, r.r, r.b);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(rr, 5, 5), bSpecial);
+            text(glyph, fIcon, rr, bText);
+        };
+        iconBtn(L.gearBtn, L"\xE713");
+        iconBtn(L.closeBtn2, L"\xE711");
+    }
     (void)monitor;
 
     // ---- status area ----
     float sy = 16.0f;
-    if (L.statusH > 90.0f) {
+    if (!L.split && L.statusH > 90.0f) {
         D2D1_RECT_F pill = Rect(16, sy, 136, sy + 56);
         ID2D1SolidColorBrush* pf = (ime == 1) ? bAccent : bSpecial;
         rt->FillRoundedRectangle(D2D1::RoundedRect(pill, 12, 12), pf);
-        std::wstring imeText = (ime == 1) ? L"中" : (ime == 0 ? L"EN" : L"\u2014");
+        std::wstring imeText = (ime == 1) ? L"中" : (ime == 0 ? L"EN" : L"—");
         text(imeText, fBig, pill, (ime == 1) ? bOnAccent : bText);
 
         std::wstring imeLine = (ime == 1) ? L"Chinese IME"
@@ -262,7 +295,7 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
         text(L"Target: " + target, fSmallL, Rect(16, ty, L.designW - 16, ty + 22), bDim);
 
         if (L.statusH > 170.0f) {
-            text(L"Tap Shift for CN/EN \u00B7 Hold Shift/Win to lock",
+            text(L"Tap Shift for CN/EN · Hold Shift/Win to lock",
                  fSmallL, Rect(16, ty + 26, L.designW - 16, ty + 48), bDim);
         }
     }
@@ -275,6 +308,10 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
         if (!zoomBtns.empty()) {
             float zr = zoomBtns.back().x + zoomBtns.back().w + 10.0f;
             if (zr > right) right = zr;
+        }
+        if (!toolBtns.empty()) {
+            float tr = toolBtns.back().x + toolBtns.back().w + 10.0f;
+            if (tr > right) right = tr;
         }
         float bottom = mons[0].y + mons[0].h + 10.0f;
         rt->FillRoundedRectangle(D2D1::RoundedRect(Rect(left, top, right, bottom), 10, 10), bSpecial);
@@ -292,6 +329,12 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
             rt->FillRoundedRectangle(D2D1::RoundedRect(r, 8, 8), bKey);
             text(z.label, fSmall, r, bText);
         }
+    }
+
+    for (const MonButton& t : toolBtns) {
+        D2D1_RECT_F r = Rect(t.x, t.y, t.x + t.w, t.y + t.h);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(r, 8, 8), bKey);
+        text(t.label, fSmall, r, bText);
     }
 
     // ---- keys ----
@@ -319,14 +362,61 @@ void Renderer::Draw(const Layout& L, float scale, float widthDip, int pressed,
         }
         if (mainLabel.empty()) continue;
 
+        if (!k.hint.empty()) {
+            D2D1_RECT_F hr = Rect(k.x + 7.0f, k.y + 2.0f,
+                                  k.x + k.w * 0.55f, k.y + k.h * 0.34f);
+            text(k.hint, fSmallL, hr, bDim);
+        }
+
         if (sub.empty()) {
-            text(mainLabel, fKey, r, labelBrush);
+            text(mainLabel, mainLabel.size() >= 3 ? fKey2 : fKey, r, labelBrush);
         } else {
             D2D1_RECT_F rt2 = Rect(k.x, k.y + k.h * 0.06f, k.x + k.w, k.y + k.h * 0.42f);
             D2D1_RECT_F rb2 = Rect(k.x, k.y + k.h * 0.40f, k.x + k.w, k.y + k.h * 0.94f);
             text(sub, fKey2, rt2, bDim);
             text(mainLabel, fKey, rb2, labelBrush);
         }
+    }
+
+    // ---- in-app mode menu (gear) ----
+    if (L.showModeMenu && (L.split || L.half || L.menuPortrait)) {
+        D2D1_RECT_F pr = Rect(L.menuPanel.l, L.menuPanel.t, L.menuPanel.r, L.menuPanel.b);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(pr, 10, 10), bSpecial);
+        rt->DrawRoundedRectangle(D2D1::RoundedRect(pr, 10, 10), bEdge, 1.0f);
+
+        if (L.menuPortrait) {
+            for (int i = 0; i < L.dispCount; ++i) {
+                D2D1_RECT_F br = Rect(L.dispBtn[i].l, L.dispBtn[i].t,
+                                      L.dispBtn[i].r, L.dispBtn[i].b);
+                bool sel = (i == L.dispSel);
+                rt->FillRoundedRectangle(D2D1::RoundedRect(br, 8, 8), sel ? bAccent : bKey);
+                text(L.dispLabel[i], fSmall, br, sel ? bOnAccent : bText);
+            }
+            D2D1_RECT_F z0 = Rect(L.zoomBtn[0].l, L.zoomBtn[0].t, L.zoomBtn[0].r, L.zoomBtn[0].b);
+            D2D1_RECT_F z1 = Rect(L.zoomBtn[1].l, L.zoomBtn[1].t, L.zoomBtn[1].r, L.zoomBtn[1].b);
+            D2D1_RECT_F z2 = Rect(L.zoomBtn[2].l, L.zoomBtn[2].t, L.zoomBtn[2].r, L.zoomBtn[2].b);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(z0, 8, 8), bKey);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(z1, 8, 8), bKey);
+            rt->FillRoundedRectangle(D2D1::RoundedRect(z2, 8, 8), bKey);
+            text(L"-", fSmall, z0, bText);
+            text(L.zoomText.empty() ? L"100%" : L.zoomText, fSmall, z1, bText);
+            text(L"+", fSmall, z2, bText);
+        } else {
+            static const wchar_t* kLabels[3] = { L"Span", L"Left", L"Right" };
+            for (int i = 0; i < 3; ++i) {
+                D2D1_RECT_F br = Rect(L.modeBtn[i].l, L.modeBtn[i].t,
+                                      L.modeBtn[i].r, L.modeBtn[i].b);
+                bool sel = (L.menuSel == i + 1);
+                rt->FillRoundedRectangle(D2D1::RoundedRect(br, 8, 8), sel ? bAccent : bKey);
+                text(kLabels[i], fSmall, br, sel ? bOnAccent : bText);
+            }
+        }
+
+        D2D1_RECT_F ar = Rect(L.acrylicBtn.l, L.acrylicBtn.t,
+                              L.acrylicBtn.r, L.acrylicBtn.b);
+        rt->FillRoundedRectangle(D2D1::RoundedRect(ar, 8, 8), L.acrylicOn ? bAccent : bKey);
+        text(L.acrylicOn ? L"Acrylic : on" : L"Acrylic : off",
+             fSmall, ar, L.acrylicOn ? bOnAccent : bText);
     }
 
     HRESULT hr = rt->EndDraw();
